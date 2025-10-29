@@ -1,0 +1,10 @@
+Django>=5.0
+djangorestframework
+numpy
+pandas
+scikit-learn
+matplotlib
+openpyxl
+gunicorn
+whitenoise
+pip freeze > requirements.txt
