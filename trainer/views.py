@@ -1,201 +1,179 @@
-from rest_framework.decorators import api_view
-from rest_framework.response import Response
-from rest_framework.views import APIView
-from rest_framework import status
+import os
+import json
+import joblib
 import pandas as pd
 import numpy as np
-from sklearn.preprocessing import LabelEncoder, MinMaxScaler
+import gdown
 
-# Importar el modelo base RBF
-from .core.rbf_model import train_rbf_model, rbf_activation
+from django.conf import settings
+from django.http import JsonResponse, FileResponse
+from rest_framework.views import APIView
+from rest_framework.parsers import MultiPartParser, FormParser
+from sklearn.model_selection import train_test_split
 
-# Variable global para mantener el último modelo entrenado en memoria
-LAST_MODEL = {}
+from trainer.core.rbf_model import train_rbf_model, predict_rbf, predict_rbf_model
 
-# -------------------------------------------------------------
-# 🧩 1️⃣ PREDICCIÓN (SIMULACIÓN)
-# -------------------------------------------------------------
-@api_view(["POST"])
-def predict_rbf_view(request):
-    """
-    Endpoint para realizar simulaciones (predicciones) con el modelo RBF ya entrenado.
-    """
-    global LAST_MODEL
-    try:
-        if not LAST_MODEL:
-            return Response(
-                {"error": "No hay modelo entrenado aún. Entrena uno primero."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        data = request.data
-        inputs = data.get("inputs", None)
-
-        if inputs is None or not isinstance(inputs, list):
-            return Response(
-                {"error": "Debes enviar una lista numérica en 'inputs'."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        # --- Recuperar modelo ---
-        centers = np.array(LAST_MODEL["weights"]["Centers_R"])
-        W0 = LAST_MODEL["weights"]["W0_Umbral"]
-        W_centers = np.array(LAST_MODEL["weights"]["W_Centers"]).reshape(-1, 1)
-        scaler = LAST_MODEL["scaler"]
-
-        # --- Calcular distancias y activaciones ---
-        X = np.array([inputs])
-        X_scaled = scaler.transform(X)
-        num_centers = centers.shape[0]
-
-        distances = np.zeros((1, num_centers))
-        for j in range(num_centers):
-            distances[0, j] = np.linalg.norm(X_scaled[0, :] - centers[j, :])
-
-        FA_matrix = rbf_activation(distances)
-        A = np.hstack((np.ones((1, 1)), FA_matrix))
-        Yr = A.dot(np.vstack(([W0], W_centers)))
-
-        return Response({"inputs": inputs, "Yr": Yr.flatten().tolist()})
-
-    except Exception as e:
-        print("❌ Error en predict:", e)
-        return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+# Directorio donde guardamos datasets y modelos
+MODEL_DIR = os.path.join(settings.BASE_DIR, "trainer", "models_data")
+os.makedirs(MODEL_DIR, exist_ok=True)
 
 
-# -------------------------------------------------------------
-# 🧩 2️⃣ ENTRENAMIENTO
-# -------------------------------------------------------------
-class TrainRBFView(APIView):
-    """
-    Entrena un modelo RBF con autodetección de variable objetivo.
-    - Si no se envía 'target', el sistema la detecta automáticamente.
-    - Codifica texto a números (LabelEncoder).
-    - Devuelve métricas, pesos, configuración y mapeos de etiquetas.
-    """
+class DatasetInfoView(APIView):
+    parser_classes = [MultiPartParser, FormParser]
 
-    def post(self, request):
-        global LAST_MODEL
+    def post(self, request, *args, **kwargs):
+        """
+        Sube un archivo CSV (o descarga desde Drive si se proporciona URL) y guarda como last_dataset.csv.
+        Devuelve info del dataset y 70% de entrenamiento (columns+values).
+        """
+        file = request.FILES.get("file")
+        google_drive_url = request.data.get("google_drive_url")
+
+        if not file and not google_drive_url:
+            return JsonResponse({"error": "Debe proporcionar un archivo o una URL de Google Drive"}, status=400)
+
         try:
-            file = request.FILES.get("file")
+            dataset_path = os.path.join(MODEL_DIR, "last_dataset.csv")
+
+            if file:
+                # Guardar el archivo subido
+                with open(dataset_path, "wb+") as dest:
+                    for chunk in file.chunks():
+                        dest.write(chunk)
+                df = pd.read_csv(dataset_path)
+            else:
+                # Descargar desde Google Drive
+                file_id = None
+                if "id=" in google_drive_url:
+                    file_id = google_drive_url.split("id=")[1].split("&")[0]
+                elif "drive.google.com/file/d/" in google_drive_url:
+                    file_id = google_drive_url.split("/d/")[1].split("/")[0]
+
+                if not file_id:
+                    return JsonResponse({"error": "URL de Drive no válida"}, status=400)
+
+                gdown.download(f"https://drive.google.com/uc?id={file_id}", dataset_path, quiet=True)
+                df = pd.read_csv(dataset_path)
+
+            # Información básica
+            num_patterns = int(df.shape[0])
+            columns = df.columns.tolist()
+            detected_target = columns[-1] if len(columns) > 1 else None
+            input_columns = columns[:-1] if len(columns) > 1 else columns
+            output_columns = [detected_target] if detected_target else []
+
+            # Proveer 70% train sample to frontend (list of lists)
+            df_train, _ = train_test_split(df, test_size=0.3, random_state=42)
+            train_data = {"columns": df_train.columns.tolist(), "values": df_train.values.tolist()}
+
+            dataset_info = {
+                "patterns_total": num_patterns,
+                "inputs_total": len(input_columns),
+                "outputs_total": len(output_columns),
+                "input_columns": input_columns,
+                "output_columns": output_columns,
+                "detected_target": detected_target,
+                "saved_path": dataset_path,
+                "format": "CSV",
+                "train_data": train_data,
+            }
+            return JsonResponse(dataset_info, status=200)
+        except Exception as e:
+            return JsonResponse({"error": str(e)}, status=500)
+
+
+class TrainRBFView(APIView):
+    def post(self, request, *args, **kwargs):
+        """
+        Usa last_dataset.csv guardado para entrenar.
+        Solo usa columnas numéricas (si hay no-numéricas, se descartan).
+        """
+        try:
             num_centers = int(request.data.get("num_centers", 3))
             optimal_error = float(request.data.get("optimal_error", 0.1))
-            user_target = request.data.get("target", None)
 
-            if not file:
-                return Response(
-                    {"error": "Debe enviar un archivo CSV, XLSX o JSON."},
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
+            dataset_path = os.path.join(MODEL_DIR, "last_dataset.csv")
+            if not os.path.exists(dataset_path):
+                return JsonResponse({"error": "No hay dataset cargado. Sube uno desde /dataset-info/."}, status=400)
 
-            # --- 1. Leer dataset ---
-            if file.name.endswith(".csv"):
-                df = pd.read_csv(file)
-            elif file.name.endswith(".xlsx"):
-                df = pd.read_excel(file)
-            elif file.name.endswith(".json"):
-                df = pd.read_json(file)
-            else:
-                return Response(
-                    {"error": "Formato no soportado (solo CSV, XLSX o JSON)."},
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
+            df = pd.read_csv(dataset_path)
+            df_num = df.select_dtypes(include=[np.number])
+            if df_num.shape[1] < 2:
+                return JsonResponse({"error": "El dataset debe tener al menos 1 entrada y 1 salida numérica."}, status=400)
 
-            if df.empty:
-                return Response({"error": "El archivo está vacío."}, status=400)
+            X = df_num.iloc[:, :-1].values
+            Y = df_num.iloc[:, -1].values.reshape(-1, 1)
 
-            # --- 2. Detectar automáticamente la columna target ---
-            if user_target and user_target in df.columns:
-                target = user_target
-            else:
-                nunique = df.nunique()
-                likely_target = nunique.idxmin()
-                if nunique[likely_target] <= 10 or df.columns[-1] == likely_target:
-                    target = likely_target
-                else:
-                    target = df.columns[-1]
+            results = train_rbf_model(X, Y, num_centers=num_centers, optimal_error=optimal_error)
 
-            # --- 3. Codificar columnas categóricas ---
-            label_mappings = {}
-            for col in df.columns:
-                if df[col].dtype == "object" or df[col].dtype == "string":
-                    encoder = LabelEncoder()
-                    df[col] = encoder.fit_transform(df[col].astype(str))
-                    label_mappings[col] = dict(
-                        zip(encoder.classes_, encoder.transform(encoder.classes_))
-                    )
-
-            # --- 4. Convertir a numérico y limpiar ---
-            df = df.apply(pd.to_numeric, errors="coerce").dropna()
-
-            if target not in df.columns:
-                return Response(
-                {"error": f"No se pudo identificar una columna objetivo válida."},
-                status=400,
-            )
-
-            # 🔹 Información del dataset para el frontend
-            dataset_info = {
-               "patterns_total": df.shape[0],
-               "input_columns": [col for col in df.columns if col != target],
-               "output_column": target
-            }
-
-            X = df.drop(columns=[target]).values
-            Y = df[[target]].values
-
-            if X.shape[0] < 3 or X.shape[1] < 1:
-               return Response(
-                   {"error": "El dataset es demasiado pequeño para entrenar."},
-                   status=400,
-               )
-
-            # --- 5. Entrenamiento RBF ---
-            results = train_rbf_model(
-                X, Y, num_centers=num_centers, optimal_error=optimal_error
-            )
-
-            # --- 6. Guardar modelo para predicción posterior ---
-            scaler = MinMaxScaler(feature_range=(0, 1)).fit(X)
-            LAST_MODEL.clear()
-            LAST_MODEL.update(
-              {
-                  "weights": results["weights"],
-                  "scaler": scaler,
-              }
-            )
-
-            # --- 7. Agregar metadata adicional ---
-            results["detected_target"] = target
-            results["dataset_info"] = dataset_info  # 🔹 Añadido para frontend
-            if label_mappings:
-               results["label_mappings"] = label_mappings
-
-            return Response(results, status=status.HTTP_200_OK)
-
-
-            # --- 5. Entrenamiento RBF ---
-            results = train_rbf_model(
-                X, Y, num_centers=num_centers, optimal_error=optimal_error
-            )
-
-            # --- 6. Guardar modelo para predicción posterior ---
-            scaler = MinMaxScaler(feature_range=(0, 1)).fit(X)
-            LAST_MODEL.clear()
-            LAST_MODEL.update(
-                {
-                    "weights": results["weights"],
-                    "scaler": scaler,
-                }
-            )
-
-            # --- 7. Agregar metadata adicional ---
-            results["detected_target"] = target
-            if label_mappings:
-                results["label_mappings"] = label_mappings
-
-            return Response(results, status=status.HTTP_200_OK)
-
+            # Ya que train_rbf_model guarda model_rbf.pkl en trainer/models_data, devolvemos results.
+            return JsonResponse({"message": "Entrenamiento completado", "results": results}, status=200)
         except Exception as e:
-            print("❌ Error en entrenamiento:", e)
-            return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            return JsonResponse({"error": str(e)}, status=500)
+
+
+class PredictTestView(APIView):
+    def get(self, request, *args, **kwargs):
+        """
+        Devuelve predicciones del 30% de prueba usando el modelo guardado.
+        """
+        try:
+            model_path = os.path.join(MODEL_DIR, "model_rbf.pkl")
+            dataset_path = os.path.join(MODEL_DIR, "last_dataset.csv")
+
+            if not os.path.exists(model_path):
+                return JsonResponse({"error": "No hay modelo entrenado."}, status=400)
+            if not os.path.exists(dataset_path):
+                return JsonResponse({"error": "No hay dataset cargado."}, status=400)
+
+            # Cargamos el modelo (contiene centers, W, scaler, X_test, Y_test)
+            model_bundle = joblib.load(model_path)
+            centers = np.array(model_bundle["centers"])
+            W = model_bundle["W"]
+            scaler = model_bundle["scaler"]
+
+            # Si X_test/Y_test fueron guardados en el bundle, los usamos directamente (recomendado)
+            if "X_test" in model_bundle and "Y_test" in model_bundle:
+                X_test = model_bundle["X_test"]
+                Y_test = model_bundle["Y_test"]
+            else:
+                # fallback: recomputar split desde el dataset
+                df = pd.read_csv(dataset_path).select_dtypes(include=[np.number])
+                X = df.iloc[:, :-1].values
+                Y = df.iloc[:, -1].values.reshape(-1, 1)
+                X_scaled = scaler.transform(X)
+                _, X_test, _, Y_test = train_test_split(X_scaled, Y, test_size=0.3, random_state=42)
+
+            Y_pred = predict_rbf(X_test, centers, W)
+
+            predicciones = [
+                {"inputs": X_test[i].tolist(), "Yd": float(Y_test[i]), "Yr": float(Y_pred[i])}
+                for i in range(len(Y_pred))
+            ]
+            return JsonResponse({"predicciones": predicciones}, status=200)
+        except Exception as e:
+            return JsonResponse({"error": str(e)}, status=500)
+
+
+class PredictManualView(APIView):
+    def post(self, request, *args, **kwargs):
+        """
+        Recibe JSON { "inputs": [x1, x2, ...] } o { "inputs": [[...],[...]] }.
+        Devuelve {"input": [...], "predicted_output": [...]} o error.
+        """
+        try:
+            inputs = request.data.get("inputs")
+            if inputs is None:
+                return JsonResponse({"error": "No se enviaron valores de entrada."}, status=400)
+
+            preds = predict_rbf_model(inputs)
+            if "error" in preds:
+                return JsonResponse(preds, status=400)
+            return JsonResponse(preds, status=200)
+        except Exception as e:
+            return JsonResponse({"error": str(e)}, status=500)
+
+
+class HealthCheckView(APIView):
+    def get(self, request, *args, **kwargs):
+        return JsonResponse({"status": "ok", "message": "Servidor funcionando correctamente 🚀"})
